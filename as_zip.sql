@@ -1,4 +1,5 @@
 CREATE OR REPLACE package as_zip
+AUTHID DEFINER
 is
 /**********************************************
 **
@@ -7,6 +8,14 @@ is
 ** Website: http://technology.amis.nl/blog
 **
 ** Changelog:
+**   Date: 22-03-2017 by Dirk Strack
+**     improve performance by using nocopy compiler hints
+**     added subtype t_path_name is varchar2(32767) for Oracle 12
+**     added procedure get_file_date_list to return arrays with file names, dates and offsets.
+**     added variant of function get_file with parameter p_offset for fast direct access.
+**   Date: 12-03-2017 by Dirk Strack
+**     added parameter p_date to add1file
+**     added check for file size limit to add1file and finish_zip
 **   Date: 04-08-2016
 **     fixed endless loop for empty/null zip file
 **   Date: 28-07-2016
@@ -47,7 +56,14 @@ THE SOFTWARE.
 
 ******************************************************************************
 ******************************************** */
-  type file_list is table of clob;
+$IF DBMS_DB_VERSION.VERSION >= 12 $THEN
+  subtype t_path_name is varchar2(32767);
+$ELSE
+  subtype t_path_name is clob;
+$END
+  type file_list is table of t_path_name;
+  type date_list is table of date;
+  type foffset_list is table of integer;
   g_size_limit integer := power(2, 32);
   g_size_limit_sqlcode integer := -20200;
   g_size_limit_message varchar2(200) := 'Maximum file size of 4GB exceeded';
@@ -101,6 +117,21 @@ THE SOFTWARE.
     , p_filename varchar2 := 'my.zip'
     );
 --
+  procedure get_file_date_list
+    ( p_zipped_blob 	in blob
+    , p_encoding 		in varchar2 := null
+    , p_file_list		out nocopy file_list
+    , p_date_list		out nocopy date_list
+    , p_offset_list		out nocopy foffset_list
+    );
+--
+  function get_file
+    ( p_zipped_blob blob
+    , p_file_name varchar2
+    , p_offset integer
+    )
+  return blob;
+--
 /*
 declare
   g_zipped_blob blob;
@@ -126,6 +157,33 @@ begin
     dbms_output.put_line( utl_raw.cast_to_varchar2( as_zip.get_file( 'MY_DIR', 'my.zip', zip_files( i ) ) ) );
   end loop;
 end;
+
+declare
+  g_zipped_blob blob;
+  g_file_list		as_zip.file_list;
+  g_date_list		as_zip.date_list;
+  g_offset_list 	as_zip.foffset_list;
+  g_unzipped_file blob;
+begin
+  as_zip.add1file( g_zipped_blob, 'test4.txt', null ); -- a empty file
+  as_zip.add1file( g_zipped_blob, 'dir1/test1.txt', utl_raw.cast_to_raw( q'<A file with some more text, stored in a subfolder which isn't added>' ) );
+  as_zip.add1file( g_zipped_blob, 'test1234.txt', utl_raw.cast_to_raw( 'A small file' ) );
+  as_zip.add1file( g_zipped_blob, 'dir2/', null ); -- a folder
+  as_zip.add1file( g_zipped_blob, 'dir3/', null ); -- a folder
+  as_zip.add1file( g_zipped_blob, 'dir3/test2.txt', utl_raw.cast_to_raw( 'A small file in a previous created folder' ) );
+  as_zip.finish_zip( g_zipped_blob );
+
+  as_zip.get_file_date_list ( g_zipped_blob, null, g_file_list, g_date_list, g_offset_list);
+  for i in 1 .. g_file_list.count loop
+  	g_unzipped_file := as_zip.get_file (g_zipped_blob, g_file_list(i), g_offset_list(i));
+    dbms_output.put_line('Pathname : ' || g_file_list(i));
+    dbms_output.put_line('Date     : ' || g_date_list(i));
+    dbms_output.put_line('Offset   : ' || g_offset_list(i));
+    dbms_output.put_line(utl_raw.cast_to_varchar2( g_unzipped_file ));
+  end loop;
+  dbms_lob.freetemporary( g_zipped_blob );
+end;
+
 */
 end;
 /
@@ -533,6 +591,151 @@ is
       utl_file.put_raw( t_fh, dbms_lob.substr( p_zipped_blob, t_len, i * t_len + 1 ) );
     end loop;
     utl_file.fclose( t_fh );
+  end;
+--
+  procedure get_file_date_list
+    ( p_zipped_blob 	in blob
+    , p_encoding 		in varchar2 := null
+    , p_file_list		out nocopy file_list
+    , p_date_list		out nocopy date_list
+    , p_offset_list		out nocopy foffset_list
+    )
+  is
+    t_ind 		integer := 0;
+    t_hd_ind 	integer := 0;
+    t_file_list file_list;
+    t_date_list date_list;
+    t_offset_list foffset_list;
+    t_encoding 	varchar2(255);
+    t_size		integer := 0;
+    t_total 	integer := 0;
+    t_date_num 	integer := 0;
+    t_time_num 	integer := 0;
+    t_date_str	varchar2(50);
+  begin
+    t_ind := nvl( dbms_lob.getlength( p_zipped_blob ), 0 ) - 21;
+    loop
+      exit when t_ind < 1 or dbms_lob.substr( p_zipped_blob, 4, t_ind ) = c_END_OF_CENTRAL_DIRECTORY;
+      t_ind := t_ind - 1;
+    end loop;
+--
+    if t_ind <= 0
+    then
+      return;
+    end if;
+--
+    t_hd_ind := blob2num( p_zipped_blob, 4, t_ind + 16 ) + 1;
+    t_file_list := file_list();
+    t_date_list := date_list();
+    t_offset_list := foffset_list();
+
+    t_size := blob2num( p_zipped_blob, 2, t_ind + 10 );
+    t_file_list.extend( t_size );
+    t_date_list.extend( t_size );
+    t_offset_list.extend( t_size );
+    -- total number of entries in the central directory
+    t_total := blob2num( p_zipped_blob, 2, t_ind + 8 );
+    for i in 1 .. t_total
+    loop
+      if p_encoding is null
+      then
+        if utl_raw.bit_and( dbms_lob.substr( p_zipped_blob, 1, t_hd_ind + 9 ), hextoraw( '08' ) ) = hextoraw( '08' )
+        then
+          t_encoding := 'AL32UTF8'; -- utf8
+        else
+          t_encoding := 'US8PC437'; -- IBM codepage 437
+        end if;
+      else
+        t_encoding := p_encoding;
+      end if;
+      t_time_num := blob2num( p_zipped_blob, 2, t_hd_ind + 12 );
+      t_date_num := blob2num( p_zipped_blob, 2, t_hd_ind + 14 );
+      t_date_str := trunc(t_date_num / 512) + 1980 || '/'	-- year
+      			|| trunc(mod(t_date_num, 512) / 32) || '/'	-- month
+      			|| mod(t_date_num, 32)	|| ' '				-- day
+      			|| trunc(t_time_num / 2048) || '.'			-- hour24
+      			|| trunc(mod(t_time_num, 2048) / 32) || '.'	-- minutes
+      			|| mod(t_time_num, 32) * 2;					-- seconds
+      t_file_list( i ) := raw2varchar2	-- path name
+                     ( dbms_lob.substr( p_zipped_blob
+                                      , blob2num( p_zipped_blob, 2, t_hd_ind + 28 )
+                                      , t_hd_ind + 46
+                                      )
+                     , t_encoding
+                     );
+      t_date_list( i ) :=  to_date(t_date_str, 'YYYY/MM/DD HH24.MI.SS');
+      t_offset_list( i ) := t_hd_ind;
+
+      t_hd_ind := t_hd_ind + 46
+                + blob2num( p_zipped_blob, 2, t_hd_ind + 28 )  -- File name length
+                + blob2num( p_zipped_blob, 2, t_hd_ind + 30 )  -- Extra field length
+                + blob2num( p_zipped_blob, 2, t_hd_ind + 32 ); -- File comment length
+    end loop;
+--
+    p_file_list := t_file_list;
+    p_date_list := t_date_list;
+    p_offset_list := t_offset_list;
+  end;
+
+--
+  function get_file
+    ( p_zipped_blob blob
+    , p_file_name varchar2
+    , p_offset integer
+    )
+  return blob
+  is
+    t_tmp 		blob;
+    t_hd_ind 	integer := p_offset;
+    t_fl_ind 	integer;
+    t_len 		integer;
+  begin
+	t_len := blob2num( p_zipped_blob, 4, t_hd_ind + 24 ); -- uncompressed length
+	if t_len = 0
+	then
+	  if substr( p_file_name, -1 ) in ( '/', '\' )
+	  then  -- directory/folder
+		return null;
+	  else -- empty file
+		return empty_blob();
+	  end if;
+	end if;
+--
+	if dbms_lob.substr( p_zipped_blob, 2, t_hd_ind + 10 ) = hextoraw( '0800' ) -- deflate
+	then
+	  t_fl_ind := blob2num( p_zipped_blob, 4, t_hd_ind + 42 );
+	  t_tmp := hextoraw( '1F8B0800000000000003' ); -- gzip header
+	  dbms_lob.copy( t_tmp
+				   , p_zipped_blob
+				   ,  blob2num( p_zipped_blob, 4, t_hd_ind + 20 )
+				   , 11
+				   , t_fl_ind + 31
+				   + blob2num( p_zipped_blob, 2, t_fl_ind + 27 ) -- File name length
+				   + blob2num( p_zipped_blob, 2, t_fl_ind + 29 ) -- Extra field length
+				   );
+	  dbms_lob.append( t_tmp, utl_raw.concat( dbms_lob.substr( p_zipped_blob, 4, t_hd_ind + 16 ) -- CRC32
+											, little_endian( t_len ) -- uncompressed length
+											)
+					 );
+	  return utl_compress.lz_uncompress( t_tmp );
+	end if;
+--
+	if dbms_lob.substr( p_zipped_blob, 2, t_hd_ind + 10 ) = hextoraw( '0000' ) -- The file is stored (no compression)
+	then
+	  t_fl_ind := blob2num( p_zipped_blob, 4, t_hd_ind + 42 );
+	  dbms_lob.createtemporary( t_tmp, true );
+	  dbms_lob.copy( t_tmp
+				   , p_zipped_blob
+				   , t_len
+				   , 1
+				   , t_fl_ind + 31
+				   + blob2num( p_zipped_blob, 2, t_fl_ind + 27 ) -- File name length
+				   + blob2num( p_zipped_blob, 2, t_fl_ind + 29 ) -- Extra field length
+				   );
+	  return t_tmp;
+	end if;
+--
+    return null;
   end;
 --
 end;
