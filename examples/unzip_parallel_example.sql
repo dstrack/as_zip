@@ -1,20 +1,39 @@
-CREATE OR REPLACE VIEW VUNZIP_PARALLEL_PROGRESS
+/*
+Copyright 2017 Dirk Strack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+CREATE OR REPLACE VIEW VUNZIP_PARALLEL_PROGRESS (
+	MESSAGE, TIME_REMAINING, TIME_ELAPSED, PERCENT, TARGET_DESC
+)
 AS -- Support for monitoring
-SELECT REPLACE(MESSAGE, TARGET_DESC) MESSAGE,
+SELECT REPLACE(MESSAGE, OPNAME ||': '|| TARGET_DESC, OPNAME) MESSAGE,
     TRUNC(TIME_REMAINING / 3600)
     || ':' || LPAD(MOD(TRUNC(TIME_REMAINING / 60), 60), 2, '0')
     || ':' || LPAD(MOD(TIME_REMAINING, 60), 2, '0') TIME_REMAINING,
     TRUNC(ELAPSED_SECONDS / 3600)
     || ':' || LPAD(MOD(TRUNC(ELAPSED_SECONDS / 60), 60), 2, '0')
     || ':' || LPAD(MOD(ELAPSED_SECONDS, 60), 2, '0') ELAPSED_SECONDS,
-    ROUND(NVL(SOFAR / NULLIF(TOTALWORK, 0), 1) * 100) AS PERCENT
+    ROUND(NVL(SOFAR / NULLIF(TOTALWORK, 0), 1) * 100) AS PERCENT,
+    TARGET_DESC
 FROM V$SESSION_LONGOPS
-WHERE USERNAME = :OWNER
+WHERE USERNAME = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
 AND OPNAME = 'Expand_Zip_Archive'
-AND TARGET_DESC = :P1_FILE_ID
 AND LAST_UPDATE_TIME > SYSDATE - 1 / 24 / 4
 ORDER BY LAST_UPDATE_TIME DESC, PERCENT
 ;
+
 
 
 -- Demo Schema
@@ -25,7 +44,7 @@ CREATE TABLE DEMO_FOLDERS (
 	PARENT_ID NUMBER,
 	FOLDER_NAME VARCHAR2(200) NOT NULL ENABLE,
 	CONSTRAINT DEMO_FOLDERS_PK PRIMARY KEY (ID),
-	CONSTRAINT DEMO_FOLDERS_FK FOREIGN KEY (PARENT_ID) REFERENCES DEMO_FOLDERS(ID),
+	CONSTRAINT DEMO_FOLDERS_FK FOREIGN KEY (PARENT_ID) REFERENCES DEMO_FOLDERS(ID) ON DELETE CASCADE,
 	CONSTRAINT DEMO_FOLDERS_UK UNIQUE (PARENT_ID, FOLDER_NAME)
 );
 
@@ -40,7 +59,7 @@ CREATE TABLE DEMO_FILES (
 	MIME_TYPE VARCHAR2(300),
 	FOLDER_ID NUMBER,
 	CONSTRAINT DEMO_FILES_PK PRIMARY KEY (ID),
-	CONSTRAINT DEMO_FILES_FK FOREIGN KEY (FOLDER_ID) REFERENCES DEMO_FOLDERS(ID),
+	CONSTRAINT DEMO_FILES_FK FOREIGN KEY (FOLDER_ID) REFERENCES DEMO_FOLDERS(ID) ON DELETE CASCADE,
 	CONSTRAINT DEMO_FILES_UK UNIQUE (FOLDER_ID, FILE_NAME)
 );
 
@@ -51,7 +70,7 @@ CREATE OR REPLACE PROCEDURE Expand_Demo_Files_Job (
 	p_File_ID 			INTEGER,
 	p_Parent_Folder 	VARCHAR2 DEFAULT '/Home',
 	p_Execute_Parallel 	BOOLEAN DEFAULT true
-)
+) -- this procedure is called on demand by an ajax request
 AUTHID DEFINER
 is
 	v_message			VARCHAR2(4000);
@@ -87,19 +106,19 @@ begin
 end;
 /
 
--- for performance comparison with the provided library APEX_ZIP from Oracle
+
 CREATE OR REPLACE PROCEDURE Expand_Apex_Zip_Job (
 	p_File_ID 			INTEGER,
 	p_Parent_Folder 	VARCHAR2 DEFAULT '/Home'
 )
 AUTHID DEFINER
-is
+is -- for performance comparison with the provided library APEX_ZIP from Oracle
 	v_zip_file blob;
 	v_unzipped_file blob;
 	v_files apex_zip.t_files;
 	v_Full_Path 	VARCHAR2(4000);
 	v_File_Name 	VARCHAR2(4000);
-	v_Folder_query  VARCHAR2(4000) := 'SELECT ID, PARENT_ID, FOLDER_NAME FROM DEMO_FOLDERS';
+	v_Folder_query  VARCHAR2(4000);
 	v_Save_File_Code VARCHAR2(4000);
 	v_root_id 		INTEGER;
 	v_Folder_Id		INTEGER;
